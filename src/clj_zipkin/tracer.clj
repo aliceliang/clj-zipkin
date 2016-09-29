@@ -1,29 +1,24 @@
 (ns clj-zipkin.tracer
-  (:require [thrift-clj.core :as thrift]
-            [clojure.data.codec.base64 :as b64]
+  (:require [clojure.data.codec.base64 :as b64]
             [clj-scribe :as scribe]
-            [thrift-clj.gen.core :as c]
-            [byte-streams]
             [clj-time.core :as time]
-            [clj-time.coerce :as time-coerce]))
+            [clj-time.coerce :as time-coerce])
+  (:import (zipkin Span Annotation Endpoint Codec BinaryAnnotation)
+           (java.nio ByteBuffer)))
 
 ;(def bann (BinaryAnnotation. "name" (byte-streams/convert "abcd" java.nio.ByteBuffer) AnnotationType/STRING nil))
 
-(def ^:dynamic *default-service-name* "Unknown Service")
+(def ^:dynamic *default-service-name* "unknown")
+(def ^:dynamic *default-component-name* "")
 
-(thrift/import
-  (:types [com.twitter.zipkin.gen
-           Span Annotation BinaryAnnotation AnnotationType Endpoint
-           LogEntry StoreAggregatesException AdjustableRateException])
-  (:clients com.twitter.zipkin.gen.ZipkinCollector))
-
-(defn ip-str-to-int [str-ip]
-   (let [nums (vec (map read-string (clojure.string/split str-ip #"\.")))]
-      (+
-         (* (nums 0) 16777216)
-         (* (nums 1) 65536)
-         (* (nums 2) 256)
-         (nums 3))))
+(defn ip-str-to-int
+  [str-ip]
+  (let [nums (vec (map read-string (clojure.string/split str-ip #"\.")))]
+    (+
+     (* (nums 0) 16777216)
+     (* (nums 1) 65536)
+     (* (nums 2) 256)
+     (nums 3))))
 
 (defn str->bytes
   [str]
@@ -31,26 +26,23 @@
 
 (defn thrift->base64
   "Serializes a thrift span object to be sent through the wires"
-  [data]
-  (let [buffer (org.apache.thrift.transport.TMemoryBuffer. 40000)
-        protocol (org.apache.thrift.protocol.TBinaryProtocol. buffer)
-        ;side effectish step
-        _ (.write (.to_thrift* data) protocol)]
-    (String. (b64/encode (.getArray buffer) 0 (.length buffer)) "UTF-8")))
+  [span]
+  (let [bytes (.writeSpan Codec/THRIFT span)]
+    (String. (b64/encode bytes) "UTF-8")))
 
 (defn host->endpoint
   "Given a host in string or map format creates a thrift zipkin endpoint object"
   [host]
-  (condp = (class host)
-    java.lang.String (Endpoint. (ip-str-to-int host) 0 *default-service-name*)
-    clojure.lang.PersistentArrayMap (Endpoint. (ip-str-to-int (or (:ip host)
-                                                                  (.getHostAddress (java.net.InetAddress/getLocalHost))))
-                                               (or (:port host) 0)
-                                               (or (:service host) *default-service-name*))
-    nil (Endpoint. (ip-str-to-int (.getHostAddress (java.net.InetAddress/getLocalHost)))
-                   0
-                   *default-service-name*)
-    (throw (str "Invalid host value" (class host) "not supported"))))
+  (let [array-map? (= (class host) clojure.lang.PersistentArrayMap)
+        service-name (if array-map? (:service host) *default-service-name*)
+        port (if array-map? (:port host) 0)
+        ipv4 (if array-map?
+               (ip-str-to-int (or (:ipv4 host) (.getHostAddress (java.net.InetAddress/getLocalHost)))))]
+    (.. (Endpoint/builder)
+        (serviceName service-name)
+        (port port)
+        (ipv4 ipv4)
+        (build))))
 
 ;;According to tryfer sources, zipkin has trouble recording traces with ids
 ;;larger than (2 ** 56) - 1
@@ -64,25 +56,25 @@
 (defn create-timestamp-span
   "Creates a new span with start/finish annotations"
   ([span host trace-id span-id parent-id start finish]
-     (create-timestamp-span) span host trace-id span-id parent-id start finish {})
+   (create-timestamp-span span host trace-id span-id parent-id start finish {}))
   ([span host trace-id span-id parent-id start finish & [annotations]]
-     (let [endpoint (host->endpoint host)
-           start-timestamp (* 1000 (time-coerce/to-long start))
-           start-annotation (Annotation. start-timestamp
-                                         (str "start:" (name span)) endpoint 0)
-           finish-annotation (Annotation. (* 1000 (time-coerce/to-long finish))
-                                          (str "end:" (name span)) endpoint 0)
-           annotations (for [[k v] annotations]
-                         (Annotation. start-timestamp
-                                      (str (name k) ":" (name v)) endpoint 0))]
-       (thrift->base64
-        (Span. trace-id
-               (name span)
-               span-id
-               parent-id
-               (apply conj annotations [start-annotation finish-annotation])
-               []
-               0)))))
+   (let  [endpoint (host->endpoint host)
+          start-timestamp (* 1000 (time-coerce/to-long start))
+          end-timestamp (* 1000 (time-coerce/to-long finish))
+          binary-annotations (if (empty? annotations)
+                               [(BinaryAnnotation/create "lc" *default-component-name* endpoint)]
+                               (for [[k v] annotations]
+                                 (BinaryAnnotation/create (name k) (name v) endpoint)))]
+     (thrift->base64
+      (.. (Span/builder)
+          (traceId (long trace-id))
+          (id span-id)
+          (parentId (long (if parent-id parent-id 0)))
+          (timestamp (long start-timestamp))
+          (duration (long (- end-timestamp start-timestamp)))
+          (name span)
+          (binaryAnnotations binary-annotations)
+          (build))))))
 
 ;;tracing macro for nested recording
 

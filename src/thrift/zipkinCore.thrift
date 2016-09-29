@@ -24,7 +24,7 @@ const string SERVER_RECV = "sr"
 
 // this represents a host and port in a network
 struct Endpoint {
-  1: i32 ipv4,
+  1: i64 ipv4,
   2: i16 port                      // beware that this will give us negative ports. some conversion needed
   3: string service_name           // which service did this operation happen on?
 }
